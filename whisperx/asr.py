@@ -53,13 +53,16 @@ class WhisperModel(faster_whisper.WhisperModel):
         result = self.model.generate(
                 encoder_output,
                 [prompt] * batch_size,
-                beam_size=options.beam_size,
-                patience=options.patience,
                 length_penalty=options.length_penalty,
                 max_length=self.max_length,
                 suppress_blank=options.suppress_blank,
                 suppress_tokens=options.suppress_tokens,
-            )
+                repetition_penalty=options.repetition_penalty,
+                no_repeat_ngram_size=options.no_repeat_ngram_size,
+                return_scores=True,
+                return_no_speech_prob=True,
+                max_initial_timestamp_index=max_initial_timestamp_index,
+            )[0]
 
         tokens_batch = [x.sequences_ids[0] for x in result]
 
