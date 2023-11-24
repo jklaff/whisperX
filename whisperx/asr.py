@@ -3,7 +3,9 @@ import warnings
 from typing import List, Union, Optional, NamedTuple
 
 import ctranslate2
+from ctranslate2.models import WhisperGenerationResult
 import faster_whisper
+from faster_whisper.transcribe import get_compression_ratio
 import numpy as np
 import torch
 from transformers import Pipeline
@@ -12,6 +14,8 @@ from transformers.pipelines.pt_utils import PipelineIterator
 from .audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
 from .vad import load_vad_model, merge_chunks
 from .types import TranscriptionResult, SingleSegment
+from loguru import logger 
+
 
 def find_numeral_symbol_tokens(tokenizer):
     numeral_symbol_tokens = []
@@ -27,6 +31,52 @@ class WhisperModel(faster_whisper.WhisperModel):
     FasterWhisperModel provides batched inference for faster-whisper.
     Currently only works in non-timestamp mode and fixed prompt for all samples in batch.
     '''
+
+    def decode_with_fallback(self, result: WhisperGenerationResult,  tokenizer: faster_whisper.tokenizer.Tokenizer, options: faster_whisper.transcribe.TranscriptionOptions):
+        
+        tokens = result.sequences_ids[0]
+        # Recover the average log prob from the returned score.
+        seq_len = len(tokens)
+        cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
+        avg_logprob = cum_logprob / (seq_len + 1)
+
+        text = tokenizer.tokenizer.decode(tokens).strip()
+
+
+        # Only makes sense if we generate with multiple temperatures
+
+        # compression_ratio = get_compression_ratio(text)
+        # if options.compression_ratio_threshold is not None:
+        #     if compression_ratio > options.compression_ratio_threshold:
+        #         needs_fallback = True  # too repetitive
+
+        #         self.logger.debug(
+        #             "Compression ratio threshold is not met with temperature %.1f (%f > %f)",
+        #             options.temperature,
+        #             compression_ratio,
+        #             options.compression_ratio_threshold,
+        #         )
+        #     else:
+        #         below_cr_threshold_results.append(decode_result)
+
+        if (
+            options.log_prob_threshold is not None
+            and avg_logprob < options.log_prob_threshold
+        ):
+            logger.info(
+                f"Log probability threshold is not met with temperature {options.temperatures[0]:.1f} ({avg_logprob} < {options.log_prob_threshold})"
+            )
+            logger.info(f"Transcript is: {text}")
+
+            if (
+                options.no_speech_threshold is not None
+                and result.no_speech_prob > options.no_speech_threshold
+            ):
+                logger.info("No Speech Prob is met. Returning empty text")
+                # Silence
+                text = ""
+        
+        return text
 
     def generate_segment_batched(self, features: np.ndarray, tokenizer: faster_whisper.tokenizer.Tokenizer, options: faster_whisper.transcribe.TranscriptionOptions, encoder_output = None):
         batch_size = features.shape[0]
@@ -50,6 +100,18 @@ class WhisperModel(faster_whisper.WhisperModel):
             round(options.max_initial_timestamp / self.time_precision)
         )
 
+        if options.temperatures[0] > 0:
+            kwargs = {
+                "beam_size": 1,
+                "num_hypotheses": options.best_of,
+                "sampling_topk": 0,
+                "sampling_temperature": options.temperatures[0],
+            }
+        else:
+            kwargs = {
+                "beam_size": options.beam_size,
+                "patience": options.patience,
+            }
         result = self.model.generate(
                 encoder_output,
                 [prompt] * batch_size,
@@ -62,7 +124,10 @@ class WhisperModel(faster_whisper.WhisperModel):
                 return_scores=True,
                 return_no_speech_prob=True,
                 max_initial_timestamp_index=max_initial_timestamp_index,
-            )[0]
+                **kwargs
+            )
+        logger.info("Result:")
+        logger.info(result)
 
         tokens_batch = [x.sequences_ids[0] for x in result]
 
@@ -71,9 +136,11 @@ class WhisperModel(faster_whisper.WhisperModel):
             for tk in tokens:
                 res.append([token for token in tk if token < tokenizer.eot])
             # text_tokens = [token for token in tokens if token < self.eot]
+            logger.info(res)
             return tokenizer.tokenizer.decode_batch(res)
 
-        text = decode_batch(tokens_batch)
+        # text = decode_batch(tokens_batch)
+        text = [self.decode_with_fallback(x, tokenizer, options) for x in result]
 
         return text
 
