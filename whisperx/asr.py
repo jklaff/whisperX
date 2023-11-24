@@ -125,7 +125,7 @@ class WhisperModel(faster_whisper.WhisperModel):
                 return_no_speech_prob=True,
                 max_initial_timestamp_index=max_initial_timestamp_index,
                 **kwargs
-            )[0]
+            )
         logger.info("Result:")
         logger.info(result)
 
