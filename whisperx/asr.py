@@ -126,8 +126,6 @@ class WhisperModel(faster_whisper.WhisperModel):
                 max_initial_timestamp_index=max_initial_timestamp_index,
                 **kwargs
             )
-        logger.info("Result:")
-        logger.info(result)
 
         tokens_batch = [x.sequences_ids[0] for x in result]
 
@@ -136,7 +134,7 @@ class WhisperModel(faster_whisper.WhisperModel):
             for tk in tokens:
                 res.append([token for token in tk if token < tokenizer.eot])
             # text_tokens = [token for token in tokens if token < self.eot]
-            logger.info(res)
+            
             return tokenizer.tokenizer.decode_batch(res)
 
         # text = decode_batch(tokens_batch)
