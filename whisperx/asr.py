@@ -180,7 +180,7 @@ class FasterWhisperPipeline(Pipeline):
         self.preset_language = language
         self.suppress_numerals = suppress_numerals
         self._batch_size = kwargs.pop("batch_size", None)
-        self._num_workers = 1
+        self._num_workers = 0 # torch.DataLoader is broken with num_workers > 0 https://github.com/pytorch/pytorch/issues/111901
         self._preprocess_params, self._forward_params, self._postprocess_params = self._sanitize_parameters(**kwargs)
         self.call_count = 0
         self.framework = framework
