@@ -26,5 +26,5 @@ setup(
         "console_scripts": ["whisperx=whisperx.transcribe:cli"],
     },
     include_package_data=True,
-    extras_require={"dev": ["pytest"]},
+    extras_require={"dev": ["pytest", "jupyter"]},
 )
