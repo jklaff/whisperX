@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import List, Union, Optional, NamedTuple
+from typing import List, Tuple, Union, Optional, NamedTuple
 
 import ctranslate2
 from ctranslate2.models import WhisperGenerationResult
@@ -32,7 +32,7 @@ class WhisperModel(faster_whisper.WhisperModel):
     Currently only works in non-timestamp mode and fixed prompt for all samples in batch.
     '''
 
-    def decode_with_fallback(self, result: WhisperGenerationResult,  tokenizer: faster_whisper.tokenizer.Tokenizer, options: faster_whisper.transcribe.TranscriptionOptions):
+    def decode_with_fallback(self, result: WhisperGenerationResult,  tokenizer: faster_whisper.tokenizer.Tokenizer, options: faster_whisper.transcribe.TranscriptionOptions, return_scores: bool) -> Tuple[str, float, float]:
         
         tokens = result.sequences_ids[0]
         # Recover the average log prob from the returned score.
@@ -59,26 +59,33 @@ class WhisperModel(faster_whisper.WhisperModel):
         #     else:
         #         below_cr_threshold_results.append(decode_result)
 
-        if (
-            options.log_prob_threshold is not None
-            and avg_logprob < options.log_prob_threshold
-        ):
-            logger.info(
-                f"Log probability threshold is not met with temperature {options.temperatures[0]:.1f} ({avg_logprob} < {options.log_prob_threshold})"
-            )
-            logger.info(f"Transcript is: {text}")
+        # We return scores now, so we can use this fallback outside of the loop
+        # if (
+        #     options.log_prob_threshold is not None
+        #     and avg_logprob < options.log_prob_threshold
+        # ):
+        #     logger.info(
+        #         f"Log probability threshold is not met with temperature {options.temperatures[0]:.1f} ({avg_logprob} < {options.log_prob_threshold})"
+        #     )
+        #     logger.info(f"Transcript is: {text}")
 
-            if (
-                options.no_speech_threshold is not None
-                and result.no_speech_prob > options.no_speech_threshold
+        #     if (
+        #         options.no_speech_threshold is not None
+        #         and result.no_speech_prob > options.no_speech_threshold
+        #     ):
+        #         logger.info("No Speech Prob is met. Returning empty text")
+        #         # Silence
+        #         text = ""
+        return text, avg_logprob, result.no_speech_prob
+
+    def generate_segment_batched(
+            self, 
+            features: np.ndarray, 
+            tokenizer: faster_whisper.tokenizer.Tokenizer, 
+            options: faster_whisper.transcribe.TranscriptionOptions, 
+            encoder_output = None,
+            return_scores = False,
             ):
-                logger.info("No Speech Prob is met. Returning empty text")
-                # Silence
-                text = ""
-        
-        return text
-
-    def generate_segment_batched(self, features: np.ndarray, tokenizer: faster_whisper.tokenizer.Tokenizer, options: faster_whisper.transcribe.TranscriptionOptions, encoder_output = None):
         batch_size = features.shape[0]
         all_tokens = []
         prompt_reset_since = 0
@@ -127,7 +134,7 @@ class WhisperModel(faster_whisper.WhisperModel):
                 **kwargs
             )
 
-        tokens_batch = [x.sequences_ids[0] for x in result]
+        # tokens_batch = [x.sequences_ids[0] for x in result]
 
         def decode_batch(tokens: List[List[int]]) -> str:
             res = []
@@ -138,9 +145,11 @@ class WhisperModel(faster_whisper.WhisperModel):
             return tokenizer.tokenizer.decode_batch(res)
 
         # text = decode_batch(tokens_batch)
-        text = [self.decode_with_fallback(x, tokenizer, options) for x in result]
-
-        return text
+        texts, avg_logprobs, no_spech_probs = [list(x) for x in zip(*[self.decode_with_fallback(x, tokenizer, options, return_scores) for x in result])]
+        if return_scores:
+            return texts, avg_logprobs, no_spech_probs
+        else:
+            return texts
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
@@ -174,12 +183,13 @@ class FasterWhisperPipeline(Pipeline):
             suppress_numerals: bool = False,
             **kwargs
     ):
-        self.model = model
+        self.model: WhisperModel = model
         self.tokenizer = tokenizer
         self.options = options
         self.preset_language = language
         self.suppress_numerals = suppress_numerals
         self._batch_size = kwargs.pop("batch_size", None)
+        self.return_scores = kwargs.pop("return_scores", False)
         self._num_workers = 0 # torch.DataLoader is broken with num_workers > 0 https://github.com/pytorch/pytorch/issues/111901
         self._preprocess_params, self._forward_params, self._postprocess_params = self._sanitize_parameters(**kwargs)
         self.call_count = 0
@@ -217,8 +227,12 @@ class FasterWhisperPipeline(Pipeline):
         return {'inputs': features}
 
     def _forward(self, model_inputs):
-        outputs = self.model.generate_segment_batched(model_inputs['inputs'], self.tokenizer, self.options)
-        return {'text': outputs}
+        outputs = self.model.generate_segment_batched(model_inputs['inputs'], self.tokenizer, self.options, return_scores=self.return_scores)
+        print(outputs)
+        if self.return_scores:
+            return {'text': outputs[0], 'avg_logprob': outputs[1], 'no_speech_prob': outputs[2]}
+        else:
+            return {'text': outputs}
 
     def postprocess(self, model_outputs):
         return model_outputs
@@ -334,7 +348,9 @@ def load_model(whisper_arch,
                model : Optional[WhisperModel] = None,
                task="transcribe",
                download_root=None,
-               threads=4):
+               threads=4,
+               return_scores=False,
+               ):
     '''Load a Whisper model for inference.
     Args:
         whisper_arch: str - The name of the Whisper model to load.
@@ -415,4 +431,5 @@ def load_model(whisper_arch,
         language=language,
         suppress_numerals=suppress_numerals,
         vad_params=default_vad_options,
+        return_scores=return_scores,
     )
