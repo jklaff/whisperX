@@ -1,17 +1,20 @@
 import os
-from typing import List, NamedTuple, Optional, Tuple, Union
+from dataclasses import replace
+from typing import List, Optional, Tuple, Union
 
 import ctranslate2
 import faster_whisper
 import numpy as np
 import torch
 from ctranslate2.models import WhisperGenerationResult
+from faster_whisper.tokenizer import Tokenizer
+from faster_whisper.transcribe import TranscriptionOptions, get_ctranslate2_storage
 from transformers import Pipeline
 from transformers.pipelines.pt_utils import PipelineIterator
 
 from .audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
 from .types import SingleSegment, TranscriptionResult
-from .vad import load_vad_model, merge_chunks
+from .vad import VoiceActivitySegmentation, load_vad_model, merge_chunks
 
 
 def find_numeral_symbol_tokens(tokenizer):
@@ -84,8 +87,8 @@ class WhisperModel(faster_whisper.WhisperModel):
     def generate_segment_batched(
         self,
         features: np.ndarray,
-        tokenizer: faster_whisper.tokenizer.Tokenizer,
-        options: faster_whisper.transcribe.TranscriptionOptions,
+        tokenizer: Tokenizer,
+        options: TranscriptionOptions,
         encoder_output=None,
         return_scores=False,
     ):
@@ -164,7 +167,7 @@ class WhisperModel(faster_whisper.WhisperModel):
         # unsqueeze if batch size = 1
         if len(features.shape) == 2:
             features = np.expand_dims(features, 0)
-        features = faster_whisper.transcribe.get_ctranslate2_storage(features)
+        features = get_ctranslate2_storage(features)
 
         return self.model.encode(features, to_cpu=to_cpu)
 
@@ -180,11 +183,11 @@ class FasterWhisperPipeline(Pipeline):
 
     def __init__(
         self,
-        model,
-        vad,
+        model: WhisperModel,
+        vad: VoiceActivitySegmentation,
         vad_params: dict,
-        options: NamedTuple,
-        tokenizer=None,
+        options: TranscriptionOptions,
+        tokenizer: Optional[Tokenizer] = None,
         device: Union[int, str, "torch.device"] = -1,
         framework="pt",
         language: Optional[str] = None,
@@ -253,9 +256,9 @@ class FasterWhisperPipeline(Pipeline):
         inputs,
         num_workers: int,
         batch_size: int,
-        preprocess_params,
-        forward_params,
-        postprocess_params,
+        preprocess_params: dict,
+        forward_params: dict,
+        postprocess_params: dict,
     ):
         dataset = PipelineIterator(inputs, self.preprocess, preprocess_params)
         if "TOKENIZERS_PARALLELISM" not in os.environ:
@@ -277,13 +280,14 @@ class FasterWhisperPipeline(Pipeline):
     def transcribe(
         self,
         audio: Union[str, np.ndarray],
-        batch_size=None,
+        batch_size: Optional[int] = None,
         num_workers=0,
-        language=None,
-        task=None,
+        language: Optional[str] = None,
+        task: Optional[str] = None,
         chunk_size=30,
         print_progress=False,
         combined_progress=False,
+        verbose=False,
     ) -> TranscriptionResult:
         if isinstance(audio, str):
             audio = load_audio(audio)
@@ -307,14 +311,17 @@ class FasterWhisperPipeline(Pipeline):
         if self.tokenizer is None:
             language = language or self.detect_language(audio)
             task = task or "transcribe"
-            self.tokenizer = faster_whisper.tokenizer.Tokenizer(
-                self.model.hf_tokenizer, self.model.model.is_multilingual, task=task, language=language
+            self.tokenizer = Tokenizer(
+                self.model.hf_tokenizer,
+                self.model.model.is_multilingual,
+                task=task,
+                language=language,
             )
         else:
             language = language or self.tokenizer.language_code
             task = task or self.tokenizer.task
             if task != self.tokenizer.task or language != self.tokenizer.language_code:
-                self.tokenizer = faster_whisper.tokenizer.Tokenizer(
+                self.tokenizer = Tokenizer(
                     self.model.hf_tokenizer,
                     self.model.model.is_multilingual,
                     task=task,
@@ -327,7 +334,7 @@ class FasterWhisperPipeline(Pipeline):
             print(f"Suppressing numeral and symbol tokens")
             new_suppressed_tokens = numeral_symbol_tokens + self.options.suppress_tokens
             new_suppressed_tokens = list(set(new_suppressed_tokens))
-            self.options = self.options._replace(suppress_tokens=new_suppressed_tokens)
+            self.options = replace(self.options, suppress_tokens=new_suppressed_tokens)
 
         segments: List[SingleSegment] = []
         batch_size = batch_size or self._batch_size
@@ -342,6 +349,10 @@ class FasterWhisperPipeline(Pipeline):
             text = out["text"]
             if batch_size in [0, 1, None]:
                 text = text[0]
+            if verbose:
+                print(
+                    f"Transcript: [{round(vad_segments[idx]['start'], 3)} --> {round(vad_segments[idx]['end'], 3)}] {text}"
+                )
             segments.append(
                 {
                     "text": text,
@@ -356,11 +367,11 @@ class FasterWhisperPipeline(Pipeline):
 
         # revert suppressed tokens if suppress_numerals is enabled
         if self.suppress_numerals:
-            self.options = self.options._replace(suppress_tokens=previous_suppress_tokens)
+            self.options = replace(self.options, suppress_tokens=previous_suppress_tokens)
 
         return {"segments": segments, "language": language}
 
-    def detect_language(self, audio: np.ndarray):
+    def detect_language(self, audio: np.ndarray) -> str:
         if audio.shape[0] < N_SAMPLES:
             print("Warning: audio is shorter than 30s, language detection may be inaccurate.")
         model_n_mels = self.model.feat_kwargs.get("feature_size")
@@ -378,30 +389,32 @@ class FasterWhisperPipeline(Pipeline):
 
 
 def load_model(
-    whisper_arch,
-    device,
+    whisper_arch: str,
+    device: str,
     device_index=0,
     compute_type="float16",
-    asr_options=None,
+    asr_options: Optional[dict] = None,
     language: Optional[str] = None,
-    vad_model=None,
-    vad_options=None,
+    vad_model: Optional[VoiceActivitySegmentation] = None,
+    vad_options: Optional[dict] = None,
     model: Optional[WhisperModel] = None,
     task="transcribe",
-    download_root=None,
+    download_root: Optional[str] = None,
+    local_files_only=False,
     threads=4,
     return_scores=False,
-):
+) -> FasterWhisperPipeline:
     """Load a Whisper model for inference.
     Args:
-        whisper_arch: str - The name of the Whisper model to load.
-        device: str - The device to load the model on.
-        compute_type: str - The compute type to use for the model.
-        options: dict - A dictionary of options to use for the model.
-        language: str - The language of the model. (use English for now)
-        model: Optional[WhisperModel] - The WhisperModel instance to use.
-        download_root: Optional[str] - The root directory to download the model to.
-        threads: int - The number of cpu threads to use per worker, e.g. will be multiplied by num workers.
+        whisper_arch - The name of the Whisper model to load.
+        device - The device to load the model on.
+        compute_type - The compute type to use for the model.
+        options - A dictionary of options to use for the model.
+        language - The language of the model. (use English for now)
+        model - The WhisperModel instance to use.
+        download_root - The root directory to download the model to.
+        local_files_only - If `True`, avoid downloading the file and return the path to the local cached file if it exists.
+        threads - The number of cpu threads to use per worker, e.g. will be multiplied by num workers.
     Returns:
         A Whisper pipeline.
     """
@@ -415,10 +428,11 @@ def load_model(
         device_index=device_index,
         compute_type=compute_type,
         download_root=download_root,
+        local_files_only=local_files_only,
         cpu_threads=threads,
     )
     if language is not None:
-        tokenizer = faster_whisper.tokenizer.Tokenizer(
+        tokenizer = Tokenizer(
             model.hf_tokenizer, model.model.is_multilingual, task=task, language=language
         )
     else:
@@ -449,10 +463,12 @@ def load_model(
         "word_timestamps": False,
         "prepend_punctuations": "\"'“¿([{-",
         "append_punctuations": "\"'.。,，!！?？:：”)]}、",
+        "multilingual": model.model.is_multilingual,
         "suppress_numerals": False,
         "max_new_tokens": None,
         "clip_timestamps": None,
         "hallucination_silence_threshold": None,
+        "hotwords": None,
     }
 
     if asr_options is not None:
@@ -461,7 +477,7 @@ def load_model(
     suppress_numerals = default_asr_options["suppress_numerals"]
     del default_asr_options["suppress_numerals"]
 
-    default_asr_options = faster_whisper.transcribe.TranscriptionOptions(**default_asr_options)
+    default_asr_options = TranscriptionOptions(**default_asr_options)
 
     default_vad_options = {"vad_onset": 0.500, "vad_offset": 0.363}
 
