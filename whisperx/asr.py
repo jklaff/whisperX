@@ -12,9 +12,9 @@ from faster_whisper.transcribe import TranscriptionOptions, get_ctranslate2_stor
 from transformers import Pipeline
 from transformers.pipelines.pt_utils import PipelineIterator
 
-from .audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
-from .types import SingleSegment, TranscriptionResult
-from .vad import VoiceActivitySegmentation, load_vad_model, merge_chunks
+from whisperx.audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
+from whisperx.types import SingleSegment, TranscriptionResult
+from whisperx.vads import Pyannote, Silero, Vad
 
 
 def find_numeral_symbol_tokens(tokenizer):
@@ -105,6 +105,7 @@ class WhisperModel(faster_whisper.WhisperModel):
             previous_tokens,
             without_timestamps=options.without_timestamps,
             prefix=options.prefix,
+            hotwords=options.hotwords,
         )
 
         encoder_output = self.encode(features)
@@ -184,7 +185,7 @@ class FasterWhisperPipeline(Pipeline):
     def __init__(
         self,
         model: WhisperModel,
-        vad: VoiceActivitySegmentation,
+        vad,
         vad_params: dict,
         options: TranscriptionOptions,
         tokenizer: Optional[Tokenizer] = None,
@@ -299,9 +300,16 @@ class FasterWhisperPipeline(Pipeline):
                 # print(f2-f1)
                 yield {"inputs": audio[f1:f2]}
 
-        vad_segments = self.vad_model(
-            {"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE}
-        )
+        # Pre-process audio and merge chunks as defined by the respective VAD child class
+        # In case vad_model is manually assigned (see 'load_model') follow the functionality of pyannote toolkit
+        if issubclass(type(self.vad_model), Vad):
+            waveform = self.vad_model.preprocess_audio(audio)
+            merge_chunks = self.vad_model.merge_chunks
+        else:
+            waveform = Pyannote.preprocess_audio(audio)
+            merge_chunks = Pyannote.merge_chunks
+
+        vad_segments = self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
         vad_segments = merge_chunks(
             vad_segments,
             chunk_size,
@@ -395,7 +403,8 @@ def load_model(
     compute_type="float16",
     asr_options: Optional[dict] = None,
     language: Optional[str] = None,
-    vad_model: Optional[VoiceActivitySegmentation] = None,
+    vad_model: Optional[Vad] = None,
+    vad_method: Optional[str] = "pyannote",
     vad_options: Optional[dict] = None,
     model: Optional[WhisperModel] = None,
     task="transcribe",
@@ -409,6 +418,7 @@ def load_model(
         whisper_arch - The name of the Whisper model to load.
         device - The device to load the model on.
         compute_type - The compute type to use for the model.
+        vad_method - The vad method to use. vad_model has higher priority if is not None.
         options - A dictionary of options to use for the model.
         language - The language of the model. (use English for now)
         model - The WhisperModel instance to use.
@@ -479,15 +489,26 @@ def load_model(
 
     default_asr_options = TranscriptionOptions(**default_asr_options)
 
-    default_vad_options = {"vad_onset": 0.500, "vad_offset": 0.363}
+    default_vad_options = {
+        "chunk_size": 30,  # needed by silero since binarization happens before merge_chunks
+        "vad_onset": 0.500,
+        "vad_offset": 0.363,
+    }
 
     if vad_options is not None:
         default_vad_options.update(vad_options)
 
+    # Note: manually assigned vad_model has higher priority than vad_method!
     if vad_model is not None:
+        print("Use manually assigned vad_model. vad_method is ignored.")
         vad_model = vad_model
     else:
-        vad_model = load_vad_model(torch.device(device), use_auth_token=None, **default_vad_options)
+        if vad_method == "silero":
+            vad_model = Silero(**default_vad_options)
+        elif vad_method == "pyannote":
+            vad_model = Pyannote(torch.device(device), use_auth_token=None, **default_vad_options)
+        else:
+            raise ValueError(f"Invalid vad_method: {vad_method}")
 
     return FasterWhisperPipeline(
         model=model,
