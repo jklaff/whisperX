@@ -13,8 +13,12 @@ from transformers import Pipeline
 from transformers.pipelines.pt_utils import PipelineIterator
 
 from whisperx.audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
+from whisperx.log_utils import get_logger
+from whisperx.schema import SingleSegment, TranscriptionResult
 from whisperx.types import SingleSegment, TranscriptionResult
 from whisperx.vads import Pyannote, Silero, Vad
+
+logger = get_logger(__name__)
 
 
 def find_numeral_symbol_tokens(tokenizer):
@@ -40,7 +44,6 @@ class WhisperModel(faster_whisper.WhisperModel):
         options: faster_whisper.transcribe.TranscriptionOptions,
         return_scores: bool,
     ) -> Tuple[str, float, float]:
-
         tokens = result.sequences_ids[0]
         # Recover the average log prob from the returned score.
         seq_len = len(tokens)
@@ -110,7 +113,9 @@ class WhisperModel(faster_whisper.WhisperModel):
 
         encoder_output = self.encode(features)
 
-        max_initial_timestamp_index = int(round(options.max_initial_timestamp / self.time_precision))
+        max_initial_timestamp_index = int(
+            round(options.max_initial_timestamp / self.time_precision)
+        )
 
         if options.temperatures[0] > 0:
             kwargs = {
@@ -153,7 +158,10 @@ class WhisperModel(faster_whisper.WhisperModel):
         texts, avg_logprobs, no_spech_probs = [
             list(x)
             for x in zip(
-                *[self.decode_with_fallback(x, tokenizer, options, return_scores) for x in result]
+                *[
+                    self.decode_with_fallback(x, tokenizer, options, return_scores)
+                    for x in result
+                ]
             )
         ]
         if return_scores:
@@ -242,10 +250,17 @@ class FasterWhisperPipeline(Pipeline):
 
     def _forward(self, model_inputs):
         outputs = self.model.generate_segment_batched(
-            model_inputs["inputs"], self.tokenizer, self.options, return_scores=self.return_scores
+            model_inputs["inputs"],
+            self.tokenizer,
+            self.options,
+            return_scores=self.return_scores,
         )
         if self.return_scores:
-            return {"text": outputs[0], "avg_logprob": outputs[1], "no_speech_prob": outputs[2]}
+            return {
+                "text": outputs[0],
+                "avg_logprob": outputs[1],
+                "no_speech_prob": outputs[2],
+            }
         else:
             return {"text": outputs}
 
@@ -275,7 +290,9 @@ class FasterWhisperPipeline(Pipeline):
         model_iterator = PipelineIterator(
             dataloader, self.forward, forward_params, loader_batch_size=batch_size
         )
-        final_iterator = PipelineIterator(model_iterator, self.postprocess, postprocess_params)
+        final_iterator = PipelineIterator(
+            model_iterator, self.postprocess, postprocess_params
+        )
         return final_iterator
 
     def transcribe(
@@ -309,7 +326,9 @@ class FasterWhisperPipeline(Pipeline):
             waveform = Pyannote.preprocess_audio(audio)
             merge_chunks = Pyannote.merge_chunks
 
-        vad_segments = self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
+        vad_segments = self.vad_model(
+            {"waveform": waveform, "sample_rate": SAMPLE_RATE}
+        )
         vad_segments = merge_chunks(
             vad_segments,
             chunk_size,
@@ -339,7 +358,7 @@ class FasterWhisperPipeline(Pipeline):
         if self.suppress_numerals:
             previous_suppress_tokens = self.options.suppress_tokens
             numeral_symbol_tokens = find_numeral_symbol_tokens(self.tokenizer)
-            print(f"Suppressing numeral and symbol tokens")
+            logger.info("Suppressing numeral and symbol tokens")
             new_suppressed_tokens = numeral_symbol_tokens + self.options.suppress_tokens
             new_suppressed_tokens = list(set(new_suppressed_tokens))
             self.options = replace(self.options, suppress_tokens=new_suppressed_tokens)
@@ -348,11 +367,17 @@ class FasterWhisperPipeline(Pipeline):
         batch_size = batch_size or self._batch_size
         total_segments = len(vad_segments)
         for idx, out in enumerate(
-            self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)
+            self.__call__(
+                data(audio, vad_segments),
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
         ):
             if print_progress:
                 base_progress = ((idx + 1) / total_segments) * 100
-                percent_complete = base_progress / 2 if combined_progress else base_progress
+                percent_complete = (
+                    base_progress / 2 if combined_progress else base_progress
+                )
                 print(f"Progress: {percent_complete:.2f}%...")
             text = out["text"]
             if batch_size in [0, 1, None]:
@@ -375,13 +400,17 @@ class FasterWhisperPipeline(Pipeline):
 
         # revert suppressed tokens if suppress_numerals is enabled
         if self.suppress_numerals:
-            self.options = replace(self.options, suppress_tokens=previous_suppress_tokens)
+            self.options = replace(
+                self.options, suppress_tokens=previous_suppress_tokens
+            )
 
         return {"segments": segments, "language": language}
 
     def detect_language(self, audio: np.ndarray) -> str:
         if audio.shape[0] < N_SAMPLES:
-            print("Warning: audio is shorter than 30s, language detection may be inaccurate.")
+            logger.warning(
+                "Audio is shorter than 30s, language detection may be inaccurate"
+            )
         model_n_mels = self.model.feat_kwargs.get("feature_size")
         segment = log_mel_spectrogram(
             audio[:N_SAMPLES],
@@ -392,7 +421,9 @@ class FasterWhisperPipeline(Pipeline):
         results = self.model.model.detect_language(encoder_output)
         language_token, language_probability = results[0][0]
         language = language_token[2:-2]
-        print(f"Detected language: {language} ({language_probability:.2f}) in first 30s of audio...")
+        logger.info(
+            f"Detected language: {language} ({language_probability:.2f}) in first 30s of audio"
+        )
         return language
 
 
@@ -418,7 +449,8 @@ def load_model(
         whisper_arch - The name of the Whisper model to load.
         device - The device to load the model on.
         compute_type - The compute type to use for the model.
-        vad_method - The vad method to use. vad_model has higher priority if is not None.
+        vad_model - The vad model to manually assign.
+        vad_method - The vad method to use. vad_model has a higher priority if it is not None.
         options - A dictionary of options to use for the model.
         language - The language of the model. (use English for now)
         model - The WhisperModel instance to use.
@@ -443,11 +475,14 @@ def load_model(
     )
     if language is not None:
         tokenizer = Tokenizer(
-            model.hf_tokenizer, model.model.is_multilingual, task=task, language=language
+            model.hf_tokenizer,
+            model.model.is_multilingual,
+            task=task,
+            language=language,
         )
     else:
-        print(
-            "No language specified, language will be first be detected for each audio file (increases inference time)."
+        logger.info(
+            "No language specified, language will be detected for each audio file (increases inference time)"
         )
         tokenizer = None
 
@@ -506,7 +541,13 @@ def load_model(
         if vad_method == "silero":
             vad_model = Silero(**default_vad_options)
         elif vad_method == "pyannote":
-            vad_model = Pyannote(torch.device(device), use_auth_token=None, **default_vad_options)
+            if device == "cuda":
+                device_vad = f"cuda:{device_index}"
+            else:
+                device_vad = device
+            vad_model = Pyannote(
+                torch.device(device_vad), use_auth_token=None, **default_vad_options
+            )
         else:
             raise ValueError(f"Invalid vad_method: {vad_method}")
 
