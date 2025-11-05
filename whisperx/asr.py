@@ -15,7 +15,6 @@ from transformers.pipelines.pt_utils import PipelineIterator
 from whisperx.audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
 from whisperx.log_utils import get_logger
 from whisperx.schema import SingleSegment, TranscriptionResult
-from whisperx.types import SingleSegment, TranscriptionResult
 from whisperx.vads import Pyannote, Silero, Vad
 
 logger = get_logger(__name__)
